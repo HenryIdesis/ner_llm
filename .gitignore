@@ -1,0 +1,15 @@
+# Ambiente virtual
+.venv/
+venv/
+
+# Arquivos temporários do Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Configurações locais
+.env
+
+# Dados brutos grandes (ajuste se o prof quiser os dados)
+data/
