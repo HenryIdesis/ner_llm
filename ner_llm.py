@@ -84,6 +84,314 @@ Texto:
     return None
 
 
+def extrair_secoes_relevantes(texto: str, data_cirurgia: Optional[str] = None) -> str:
+    """
+    Extrai as seções mais relevantes do prontuário, mantendo contexto completo.
+    Estratégia: pega MUITO mais contexto para garantir que nada importante seja perdido.
+    """
+    secoes = []
+    
+    # 1. Início do prontuário (dados do paciente, data nascimento) - CRÍTICO para idade
+    # AUMENTADO para garantir que todos os dados do paciente sejam incluídos
+    inicio = texto[:150000]  # Primeiros 150k chars têm dados do paciente e histórico completo
+    secoes.append("=== INÍCIO DO PRONTUÁRIO (DADOS DO PACIENTE E HISTÓRICO COMPLETO) ===\n" + inicio)
+    
+    # 2. Se data_cirurgia conhecida, extrai contexto amplo ao redor dela
+    if data_cirurgia:
+        # Procura todas as ocorrências da data da cirurgia
+        padrao_data = re.escape(data_cirurgia.replace("/", "[/-]"))
+        matches = list(re.finditer(padrao_data, texto, re.IGNORECASE))
+        
+        # Pega contexto MUITO amplo ao redor de cada ocorrência (até 8 ocorrências)
+        for match in matches[:8]:
+            # Contexto MUITO maior: 20k chars antes e 30k depois da data
+            inicio_ctx = max(0, match.start() - 20000)
+            fim_ctx = min(len(texto), match.end() + 30000)
+            contexto = texto[inicio_ctx:fim_ctx]
+            
+            # Verifica se é contexto relevante (exenteração, cirurgia, etc)
+            if any(palavra in contexto.lower() for palavra in ["exentera", "cirurgia", "operacao", "po", "p.o", "internacao", "uti", "alta"]):
+                secoes.append(f"\n=== CONTEXTO DA CIRURGIA PRINCIPAL ({data_cirurgia}) ===\n{contexto}")
+    
+    # 3. Procura especificamente por laudos de AP próximos da data da cirurgia
+    # CRÍTICO: Busca mais agressiva por AP - inclui "exame anatomopatológico" também
+    padrao_ap = r"(?:produto\s+de\s+exentera|anatomia\s+patologica|laudo\s+anatomopatologico|exame\s+anatomopatologico|ap\s*[:]|estadiamento\s+tnm)"
+    matches_ap = list(re.finditer(padrao_ap, texto, re.IGNORECASE | re.DOTALL))
+    
+    # CRÍTICO: Sempre inclui AP encontrado, mesmo que não esteja próximo da data
+    # O LLM precisa ver TODOS os laudos de AP para encontrar o correto
+    for match in matches_ap[:5]:  # Pega até 5 laudos de AP
+        # Contexto MUITO maior para AP: 10k antes e 30k depois
+        contexto_ap = texto[max(0, match.start()-10000):match.end()+30000]
+        
+        # Prioriza se está próximo da cirurgia, mas SEMPRE inclui
+        if data_cirurgia:
+            ano_cir = data_cirurgia.split("/")[2] if "/" in data_cirurgia else ""
+            if data_cirurgia[:7] in contexto_ap or ano_cir in contexto_ap or "exentera" in contexto_ap.lower():
+                secoes.append(f"\n=== LAUDO DE ANATOMIA PATOLÓGICA (CIRURGIA PRINCIPAL - PRIORIDADE) ===\n{contexto_ap}")
+            else:
+                # Mesmo que não esteja próximo, inclui (pode ser o laudo correto)
+                secoes.append(f"\n=== LAUDO DE ANATOMIA PATOLÓGICA ===\n{contexto_ap}")
+        else:
+            secoes.append(f"\n=== LAUDO DE ANATOMIA PATOLÓGICA ===\n{contexto_ap}")
+    
+    # 4. Procura especificamente por informações de internação (dias internação, UTI, alta)
+    if data_cirurgia:
+        # Procura padrões relacionados a internação
+        padroes_internacao = [
+            r"dias\s+de\s+internac[aao]+",
+            r"dias\s+uti",
+            r"alta\s+[:\s]+(\d{2}/\d{2}/\d{4})",
+            r"entrada\s+[:\s]+(\d{2}/\d{2}/\d{4})",
+        ]
+        
+        # Procura TODOS os padrões de internação e inclui os próximos da cirurgia
+        todos_contextos_internacao = []
+        for padrao in padroes_internacao:
+            matches = list(re.finditer(padrao, texto, re.IGNORECASE | re.DOTALL))
+            for match in matches[:10]:  # Até 10 ocorrências por padrão
+                # Contexto maior: 8k antes e 12k depois
+                contexto = texto[max(0, match.start()-8000):match.end()+12000]
+                # Verifica se está próximo da data da cirurgia
+                if data_cirurgia:
+                    ano_cir = data_cirurgia.split("/")[2] if "/" in data_cirurgia else ""
+                    if data_cirurgia[:7] in contexto or ano_cir in contexto:
+                        todos_contextos_internacao.append((contexto, match.start()))
+        
+        # Ordena por proximidade da data da cirurgia e pega os mais próximos
+        if todos_contextos_internacao:
+            todos_contextos_internacao.sort(key=lambda x: x[1])  # Ordena por posição
+            # Pega os 3 contextos mais próximos da cirurgia
+            for contexto, _ in todos_contextos_internacao[:3]:
+                secoes.append(f"\n=== INFORMAÇÕES DE INTERNAÇÃO ===\n{contexto}")
+    
+    # 4. Fim do prontuário (pode ter resumos e informações finais)
+    fim = texto[-100000:]  # Últimos 100k chars (aumentado)
+    secoes.append("\n=== FIM DO PRONTUÁRIO (RESUMOS E INFORMAÇÕES FINAIS) ===\n" + fim)
+    
+    texto_relevante = "\n\n".join(secoes)
+    
+    # Remove duplicatas mantendo ordem (mas preserva seções importantes)
+    # CRÍTICO: Não remove seções de AP, internação ou cirurgia principal
+    secoes_unicas = []
+    conteudos_vistos = set()
+    
+    for secao in secoes:
+        secao_lower = secao.lower()
+        # Seções críticas SEMPRE são incluídas (não remove duplicatas delas)
+        is_critica = any(palavra in secao_lower for palavra in [
+            "anatomia patologica", "laudo de anatomia", "produto de exentera",
+            "cirurgia principal", "internacao", "uti", "alta"
+        ])
+        
+        if is_critica:
+            # Seções críticas: sempre inclui, mesmo se duplicada
+            secoes_unicas.append(secao)
+        else:
+            # Outras seções: remove duplicatas
+            assinatura = secao[:500].strip()
+            hash_assinatura = hash(assinatura)
+            
+            if hash_assinatura not in conteudos_vistos:
+                conteudos_vistos.add(hash_assinatura)
+                secoes_unicas.append(secao)
+    
+    texto_relevante = "\n\n".join(secoes_unicas)
+    
+    # CRÍTICO: Garante que seções importantes (AP, internação) SEMPRE sejam incluídas
+    # Estratégia: separa seções críticas das outras e garante que críticas sempre caibam
+    if len(texto_relevante) > 300000:
+        partes = texto_relevante.split("\n=== ")
+        if len(partes) >= 2:
+            # Separa seções críticas das outras
+            secoes_criticas = []
+            secoes_normais = []
+            
+            for parte in partes[1:]:
+                parte_lower = parte.lower()
+                if any(palavra in parte_lower for palavra in [
+                    "anatomia patologica", "laudo de anatomia", "produto de exentera",
+                    "cirurgia principal", "internacao", "uti", "alta"
+                ]):
+                    secoes_criticas.append(parte)
+                else:
+                    secoes_normais.append(parte)
+            
+            # Monta texto final: início + críticas completas + normais limitadas + fim
+            texto_final = partes[0]  # Início completo (dados paciente)
+            
+            # CRÍTICAS: sempre inclui completas (até 60k cada)
+            for secao_critica in secoes_criticas:
+                texto_final += "\n=== " + secao_critica[:60000]
+            
+            # NORMAIS: inclui limitadas (até 20k cada, até completar limite)
+            espaco_restante = 300000 - len(texto_final)
+            for secao_normal in secoes_normais:
+                if len(texto_final) + len(secao_normal[:20000]) < 300000:
+                    texto_final += "\n=== " + secao_normal[:20000]
+                else:
+                    break
+            
+            if len(partes) > 1:
+                texto_final += "\n=== " + partes[-1]  # Fim completo
+            
+            texto_relevante = texto_final[:300000]
+    
+    return texto_relevante
+
+
+def extrair_campos_criticos_llm(texto: str, data_cirurgia: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Extrai campos críticos que mais erram usando LLM em uma única chamada.
+    Extrai seções relevantes do prontuário mantendo contexto completo.
+    """
+    # Extrai seções mais relevantes mantendo contexto
+    texto_relevante = extrair_secoes_relevantes(texto, data_cirurgia)
+    
+    # Campos críticos que mais erram (baseado no relatório)
+    # IMPORTANTE: O LLM precisa entender o CONTEXTO COMPLETO do prontuário
+    campos_desc = {
+        "dt_SO": f"Data da CIRURGIA PRINCIPAL de exenteração pélvica (formato: dd/mm/aaaa). Procure por 'Exenteração' seguida de data, ou 'PO (data)', ou data próxima de menções de exenteração pélvica. NÃO pegue cirurgias antigas (ex: 2009). Se não encontrar, null",
+        "idade": f"Idade do paciente NA DATA DA CIRURGIA PRINCIPAL ({data_cirurgia if data_cirurgia else 'procure pela data da exenteração'}). Calcule baseado em 'Data Nascto' e data da cirurgia. Se encontrar 'X anos' próximo de dt registro da cirurgia principal, use esse valor. Número inteiro. Se não encontrar, null",
+        "ASA": "Classificação ASA PRÉ-OPERATÓRIA da cirurgia principal. Procure 'ASA' em contexto de 'avaliação pré-op' ou 'pré-operatório' próximo da data da cirurgia principal. Pode estar como número (1-4) ou romano (I-IV). Se não encontrar, null",
+        "IMC": "Índice de Massa Corporal PRÉ-OPERATÓRIO da cirurgia principal. Procure 'IMC' em contexto pré-operatório, próximo da data da cirurgia principal. Número decimal (ex: 24.4). Se não encontrar, null",
+        "ECOG": "Performance Status ECOG PRÉ-OPERATÓRIO da cirurgia principal. Procure 'ECOG' em contexto pré-operatório próximo da data da cirurgia. Valores: 0, 1, 2, 3 ou 4. Se não encontrar, null",
+        "KPS": "Karnofsky Performance Status PRÉ-OPERATÓRIO da cirurgia principal. Procure 'KPS' em contexto pré-operatório próximo da data da cirurgia. Valores: 0-100. Se não encontrar, null",
+        "AP": "Estadiamento TNM da CIRURGIA PRINCIPAL. CRÍTICO: Procure ESPECIFICAMENTE no laudo de 'produto de exenteração pélvica' ou 'anatomia patológica' da cirurgia principal. O TNM pode estar escrito como 'pT4b pN1b', 'pT4b pN1b pM0', 'T4b N1b', 'pT4b pN1b' (com ou sem espaços). Procure em TODAS as seções que mencionam 'produto de exenteração', 'anatomia patológica', 'laudo anatomopatológico', 'AP:', 'estadiamento'. O TNM pode estar em qualquer parte do laudo, não apenas no início. Formato esperado: pT4b pN1b pM0 ou pT4b pN1b (sem M). NÃO pegue de cirurgias antigas. Se não encontrar após análise completa, null",
+        "estadiamento": "Estadiamento numérico baseado no AP da cirurgia principal: T4+N1=3, T4+N0=2, T3=2, T2=1, T1=0. Se não encontrar, null",
+        "T": "T do TNM da cirurgia principal. Extraia do AP (ex: se AP é 'pT4b pN1b', então T é 'T4b'). Se não encontrar, null",
+        "N": "N do TNM da cirurgia principal no formato X/Y (ex: 2/26). Procure padrões como '1/4 linfonodos' ou '2/26' em contexto de linfonodos dissecados da CIRURGIA PRINCIPAL. Se não encontrar, null",
+        "N_A": "Número de linfonodos acometidos da cirurgia principal. É o primeiro número do formato N (ex: se N é '2/26', então N_A é 2). Se não encontrar, null",
+        "dias_internação": "Dias de internação da CIRURGIA PRINCIPAL. Procure por 'dias de internação', 'dias internacao', 'permanência', ou calcule pela diferença entre 'entrada' e 'alta' da internação da cirurgia principal. Procure próximo da data da cirurgia principal. Número inteiro. Se não encontrar após análise completa, null",
+        "dias_uti": "Dias de UTI da internação da CIRURGIA PRINCIPAL. Procure por 'dias UTI', 'dias de UTI', 'permanência UTI', 'permanencia UTI' da internação da cirurgia principal. Procure próximo da data da cirurgia principal. Número inteiro. Se não encontrar após análise completa, null",
+        "dt_alta": "Data de alta da internação da CIRURGIA PRINCIPAL (formato: dd/mm/aaaa). Procure por 'alta', 'data de alta', 'dt alta', 'data alta' próxima da data da cirurgia principal. Procure em evoluções de alta ou sumários de alta. Se não encontrar após análise completa, null",
+        "cirurgia_recidiva": "A CIRURGIA PRINCIPAL foi uma cirurgia DE recidiva? Procure se a exenteração foi feita 'por recidiva' ou 'devido a recidiva'. 0=não foi cirurgia de recidiva, 1=foi cirurgia DE recidiva, 88=não aplicável. Se não encontrar, null",
+        "local_tumor": "Localização do tumor principal (ex: reto, sigmoide, colon). Procure em contexto do diagnóstico inicial ou do tumor principal. Se não encontrar, null",
+    }
+    
+    tamanho_texto = len(texto_relevante)
+    
+    prompt = f"""Você é um especialista em análise de prontuários médicos eletrônicos.
+
+CONTEXTO CRÍTICO: Você recebeu um prontuário médico COMPLETO de um paciente. Este prontuário contém TODO o histórico médico do paciente, incluindo:
+- Múltiplas consultas ao longo dos anos
+- Múltiplas cirurgias (algumas antigas, algumas recentes)
+- Exames e laudos de anatomia patológica
+- Evoluções clínicas e internações
+- Dados pré-operatórios de diferentes épocas
+
+TAREFA PRINCIPAL: Identificar a CIRURGIA PRINCIPAL de exenteração pélvica e extrair informações ESPECIFICAMENTE dessa cirurgia.
+
+REGRA DE OURO: A CIRURGIA PRINCIPAL é geralmente a exenteração pélvica mais RECENTE e IMPORTANTE mencionada no prontuário. Ela é diferente de cirurgias antigas (ex: cirurgias de 2009, 2012, etc).
+
+IDENTIFICAÇÃO DA CIRURGIA PRINCIPAL:
+- Procure por menções de "Exenteração Pélvica" ou "Exenteração Pelvica"
+- A data da cirurgia principal é: {data_cirurgia if data_cirurgia else 'PROCURE pela data da exenteração pélvica mais recente'}
+- Todos os valores extraídos DEVEM ser dessa cirurgia específica, não de outras
+
+ESTRATÉGIA DE EXTRAÇÃO:
+1. Leia TODO o prontuário para entender a sequência temporal dos eventos
+2. Identifique claramente qual é a CIRURGIA PRINCIPAL (exenteração pélvica mais recente)
+3. Para cada campo abaixo, procure o valor ESPECÍFICO dessa cirurgia principal
+4. Valores pré-operatórios (ASA, IMC, ECOG, KPS) devem ser os da avaliação pré-op DA CIRURGIA PRINCIPAL
+5. Valores de patologia (AP, T, N, N_A) devem ser do laudo DA CIRURGIA PRINCIPAL
+6. Valores de internação (dias_internação, dias_uti, dt_alta) devem ser da internação DA CIRURGIA PRINCIPAL
+
+CAMPOS A EXTRAIR (TODOS da CIRURGIA PRINCIPAL):
+"""
+    
+    for campo, descricao in campos_desc.items():
+        prompt += f"\n{campo}: {descricao}"
+    
+    prompt += f"""
+
+INSTRUÇÕES GERAIS:
+1. Leia TODO o prontuário para entender o contexto completo
+2. Identifique a CIRURGIA PRINCIPAL (exenteração pélvica mais recente)
+3. Para cada campo, procure o valor ESPECÍFICO da cirurgia principal
+4. Se um campo não for encontrado, use null (não invente valores)
+5. Para números, retorne apenas o número (sem aspas)
+6. Para datas, use formato dd/mm/aaaa
+7. Para strings, retorne o valor exato encontrado
+8. NÃO pegue valores de cirurgias antigas (ex: 2009, 2012) - apenas da cirurgia principal
+9. Considere o CONTEXTO TEMPORAL - valores pré-operatórios devem ser próximos da data da cirurgia principal
+
+SEÇÕES RELEVANTES DO PRONTUÁRIO ({tamanho_texto} caracteres extraídos de {len(texto)} total):
+{texto_relevante}
+
+IMPORTANTE: 
+- Analise TODO o texto para entender o contexto completo
+- Identifique a sequência temporal dos eventos
+- Extraia valores ESPECIFICAMENTE da cirurgia principal
+- Retorne TODOS os campos solicitados
+- Se encontrar o valor, retorne. Se não encontrar, retorne null
+
+CRÍTICO: Você DEVE retornar TODOS os 16 campos solicitados. Se encontrar o valor, retorne. Se NÃO encontrar após analisar TODO o texto, retorne null para aquele campo.
+
+Retorne APENAS um JSON válido no formato (exemplo):
+{{"dt_SO": "20/01/2017", "idade": 51, "ASA": 2, "IMC": 24.4, "ECOG": 0, "KPS": 90, "AP": "pT4b pN1b", "estadiamento": 3, "T": "T4b", "N": "2/26", "N_A": 2, "dias_internação": 11, "dias_uti": 3, "dt_alta": "31/01/2017", "cirurgia_recidiva": 1, "local_tumor": "reto"}}
+
+IMPORTANTE: 
+- NÃO deixe campos de fora
+- Se não encontrar após análise completa, use null
+- Analise TODO o texto fornecido, não apenas partes
+"""
+    
+    resposta = chamar_llm(
+        "Você é um especialista em análise de prontuários médicos. Você analisa TODO o contexto do prontuário para extrair informações precisas da cirurgia principal. Retorne APENAS JSON válido, sem explicações ou markdown.",
+        prompt,
+        max_tokens=2000,  # Aumentado ainda mais para respostas completas
+        temperature=0.0  # Temperatura 0 para máxima consistência
+    )
+    
+    if not resposta:
+        return {}
+    
+    # Tenta parsear JSON
+    try:
+        # Remove markdown code blocks se houver
+        resposta_limpa = resposta.strip()
+        if resposta_limpa.startswith("```"):
+            resposta_limpa = resposta_limpa.split("```")[1]
+            if resposta_limpa.startswith("json"):
+                resposta_limpa = resposta_limpa[4:]
+        resposta_limpa = resposta_limpa.strip()
+        
+        resultado = json.loads(resposta_limpa)
+        
+        # Converte tipos conforme necessário
+        resultado_final = {}
+        for campo, valor in resultado.items():
+            if valor is None or valor == "null" or valor == "":
+                resultado_final[campo] = None
+            elif campo in ["idade", "ASA", "ECOG", "KPS", "N_A", "dias_internação", "dias_uti", "estadiamento", "cirurgia_recidiva"]:
+                try:
+                    resultado_final[campo] = int(valor) if valor != "null" else None
+                except:
+                    resultado_final[campo] = None
+            elif campo == "IMC":
+                try:
+                    resultado_final[campo] = float(valor) if valor != "null" else None
+                except:
+                    resultado_final[campo] = None
+            else:
+                resultado_final[campo] = valor if valor != "null" else None
+        
+        return resultado_final
+    except Exception as e:
+        # Se falhar, tenta extrair campos individualmente da resposta
+        resultado = {}
+        for campo in campos_desc.keys():
+            # Tenta encontrar padrões na resposta
+            padrao = rf'["\']?{campo}["\']?\s*[:=]\s*([^,}}"]+)'
+            match = re.search(padrao, resposta, re.IGNORECASE)
+            if match:
+                valor = match.group(1).strip().strip('"').strip("'")
+                if valor.lower() not in ["null", "none", "n/a"]:
+                    resultado[campo] = valor
+        return resultado
+
+
 def carregar_gabarito() -> pd.DataFrame:
     """Lê a planilha Excel. A linha 1 tem os nomes das colunas, dados começam na linha 2."""
     df_bruto = pd.read_excel(GABARITO_PATH, header=None)
@@ -137,6 +445,130 @@ def normalizar(texto: str) -> str:
     texto = unicodedata.normalize("NFKD", texto)
     texto = "".join(ch for ch in texto if not unicodedata.combining(ch))
     return texto.lower()
+
+
+def localizar_contexto_por_palavras(
+    texto: str,
+    palavras_chave: List[str],
+    data_cirurgia: Optional[str] = None,
+    raio: int = 5000,
+) -> str:
+    """
+    Retorna um trecho do texto próximo das palavras-chave e, se possível,
+    da data da cirurgia. Esse contexto é reutilizado por vários campos.
+    """
+    if not texto:
+        return ""
+
+    texto_lower = texto.lower()
+    melhor = ""
+    melhor_score = -1
+    data_lower = data_cirurgia.lower() if data_cirurgia else None
+    ano_cirurgia = None
+    if data_cirurgia and "/" in data_cirurgia:
+        ano_cirurgia = data_cirurgia.split("/")[-1]
+
+    for palavra in palavras_chave:
+        termo = palavra.lower()
+        inicio_busca = 0
+        while True:
+            idx = texto_lower.find(termo, inicio_busca)
+            if idx == -1:
+                break
+            inicio = max(0, idx - raio)
+            fim = min(len(texto), idx + len(termo) + raio)
+            trecho = texto[inicio:fim]
+
+            score = 1
+            trecho_lower = trecho.lower()
+            if data_lower and data_lower in trecho_lower:
+                score += 3
+            if ano_cirurgia and ano_cirurgia in trecho_lower:
+                score += 1
+
+            # Prioriza contextos que contenham múltiplas palavras relevantes
+            for outra_palavra in palavras_chave:
+                if outra_palavra.lower() in trecho_lower and outra_palavra.lower() != termo:
+                    score += 1
+
+            if score > melhor_score:
+                melhor_score = score
+                melhor = trecho
+            inicio_busca = idx + len(termo)
+
+    return melhor
+
+
+def construir_contextos_cirurgia(texto: str, data_cirurgia: Optional[str] = None) -> Dict[str, str]:
+    """
+    Consolida contextos específicos (pré-op, AP/cirurgia, internação)
+    para reutilizar nas funções de extração e reduzir leituras repetidas.
+    """
+    contexto_preop = localizar_contexto_por_palavras(
+        texto,
+        palavras_chave=[
+            "avaliação pré",
+            "avaliacao pre",
+            "asa",
+            "ecog",
+            "kps",
+            "imc",
+            "pré operatório",
+            "pre operatorio",
+            "pre-op",
+        ],
+        data_cirurgia=data_cirurgia,
+        raio=6000,
+    )
+
+    contexto_ap = localizar_contexto_por_palavras(
+        texto,
+        palavras_chave=[
+            "produto de exentera",
+            "laudo anatomopatologico",
+            "anatomia patologica",
+            "estadiamento tnm",
+            "ap:",
+        ],
+        data_cirurgia=data_cirurgia,
+        raio=8000,
+    )
+
+    contexto_internacao = localizar_contexto_por_palavras(
+        texto,
+        palavras_chave=[
+            "internacao",
+            "internação",
+            "permanencia",
+            "permanência",
+            "uti",
+            "alta hospitalar",
+            "evolucao",
+            "evolução",
+        ],
+        data_cirurgia=data_cirurgia,
+        raio=10000,
+    )
+
+    contexto_cirurgia = contexto_ap or localizar_contexto_por_palavras(
+        texto,
+        palavras_chave=[
+            "exenteração",
+            "exenteracao",
+            "cirurgia",
+            "procedimento",
+            "relatorio operatorio",
+        ],
+        data_cirurgia=data_cirurgia,
+        raio=8000,
+    )
+
+    return {
+        "preop": contexto_preop,
+        "ap": contexto_ap,
+        "internacao": contexto_internacao,
+        "cirurgia": contexto_cirurgia,
+    }
 
 
 def extrair_data_cirurgia(texto: str) -> Optional[str]:
@@ -243,128 +675,71 @@ def extrair_blocos_data_nascto(texto: str):
     return blocos
 
 
-def extrair_idade(texto: str, data_cirurgia: Optional[str] = None):
-    """
-    Tenta calcular idade de várias formas:
-    1. Data nascimento + data cirurgia
-    2. Blocos "Data Nascto ... X anos ... Dt Registro"
-    3. "X anos" no texto com contexto
-    4. LLM se houver ambiguidade
-    """
-    # Primeiro tenta pela data de nascimento
-    padroes_nasc = [
-        r"data\s+nascto\s+(\d{2}/\d{2}/\d{4})",
-        r"data\s+nascimento\s+(\d{2}/\d{2}/\d{4})",
-        r"dta\.?\s+de\s+nascimento\s+(\d{2}/\d{2}/\d{4})",
-        r"dia\.?\s+de\s+nascimento\s+(\d{2}/\d{2}/\d{4})",
-    ]
-    
-    dt_nasc = None
-    for padrao in padroes_nasc:
-        match = re.search(padrao, texto, re.IGNORECASE)
-        if match:
-            try:
-                dt_nasc = datetime.strptime(match.group(1), "%d/%m/%Y")
-                break
-            except:
-                continue
-    
-    if dt_nasc and data_cirurgia:
-        try:
-            dt_cir = datetime.strptime(data_cirurgia.replace("-", "/"), "%d/%m/%Y")
-            idade = (dt_cir.year - dt_nasc.year) - ((dt_cir.month, dt_cir.day) < (dt_nasc.month, dt_nasc.day))
-            if 0 < idade < 100:
-                return idade
-        except:
-            pass
-    
-    # Tenta pelos blocos com data de registro
-    blocos = extrair_blocos_data_nascto(texto)
-    if blocos and data_cirurgia:
-        try:
-            dt_cir = datetime.strptime(data_cirurgia.replace("-", "/"), "%d/%m/%Y")
-            blocos_com_score = []
-            for b in blocos:
-                try:
-                    dt_reg = datetime.strptime(b["dt_registro"], "%d/%m/%Y")
-                    diff_dias = abs((dt_cir - dt_reg).days)
-                    score = max(0, 365 - diff_dias)  # Quanto mais próximo, maior o score
-                    blocos_com_score.append((b["idade"], score))
-                except:
-                    blocos_com_score.append((b["idade"], 0))
-            if blocos_com_score:
-                blocos_com_score.sort(key=lambda x: x[1], reverse=True)
-                idade = blocos_com_score[0][0]
-                if 0 < idade < 100:
-                    return idade
-        except:
-            pass
-    
-    # Se tiver blocos mas sem data cirurgia, pega a idade mais provável
-    if blocos:
-        idades_validas = [b["idade"] for b in blocos if 0 < b["idade"] < 100]
-        if idades_validas:
-            idades_ordenadas = sorted(idades_validas)
-            # Prioriza idades na faixa comum (40-80)
-            idades_relevantes = [i for i in idades_ordenadas if 40 <= i <= 80]
-            if idades_relevantes:
-                # Pega a mais próxima de 60 (mediana da faixa)
-                idades_relevantes.sort(key=lambda x: abs(x - 60))
-                return idades_relevantes[0]
-            return idades_ordenadas[-1]
-    
-    # Último recurso: procura "X anos" no texto
-    t = normalizar(texto)
-    idades_encontradas = []
-    
-    for match in re.finditer(r"(\d{1,3})\s+anos", t):
-        idade = int(match.group(1))
-        if not (30 <= idade <= 90):
+def extrair_idade(
+    texto: str,
+    data_cirurgia: Optional[datetime] = None,
+    sugestao_llm: Optional[int] = None,
+) -> Optional[int]:
+    padrao = re.compile(
+        r"(idade\s*[:=]\s*(\d{1,3}))|(\b(\d{1,3})\s*anos\b)",
+        re.IGNORECASE,
+    )
+
+    candidatos = []
+
+    for m in padrao.finditer(texto):
+        idade_str = m.group(2) or m.group(4)
+        if not idade_str:
             continue
-        
-        inicio = max(0, match.start() - 200)
-        fim = min(len(t), match.end() + 200)
-        trecho = t[inicio:fim]
-        
+
+        try:
+            idade = int(idade_str)
+        except ValueError:
+            continue
+
+        # Faixa razoável
+        if idade < 15 or idade > 100:
+            continue
+
+        posicao = m.start()
         score = 0
-        if "paciente" in trecho:
+
+        # Preferir idade mencionada no começo do texto
+        if posicao < len(texto) * 0.3:
             score += 2
-        if "cirurgia" in trecho or "operacao" in trecho or "so" in trecho:
-            score += 4
-        if "pre" in trecho and "op" in trecho:
-            score += 5
-        if "dt registro" in trecho or "data registro" in trecho:
-            score += 2
-        # Penaliza se for idade de outra pessoa
-        if any(palavra in trecho for palavra in ["irmao", "filho", "pai", "mae"]):
-            score -= 5
-        
-        idades_encontradas.append((idade, score))
-    
-    if not idades_encontradas:
-        return None
-    
-    # Se houver muitas idades com scores parecidos, usa LLM
-    if len(idades_encontradas) > 2:
-        idades_encontradas.sort(key=lambda x: x[1], reverse=True)
-        top_scores = [s for _, s in idades_encontradas[:3]]
-        if len(set(top_scores)) > 1 and max(top_scores) - min(top_scores) < 3:
-            resultado_llm = extrair_com_llm(texto, "idade", "Idade do paciente na data da cirurgia", "número inteiro (ex: 51)")
-            if resultado_llm:
-                try:
-                    idade_llm = int(resultado_llm)
-                    if 30 <= idade_llm <= 90:
-                        return idade_llm
-                except:
-                    pass
-    
-    idades_encontradas.sort(key=lambda x: x[1], reverse=True)
-    return idades_encontradas[0][0]
+        else:
+            score += 1
+
+        contexto_inicio = max(0, posicao - 80)
+        contexto_fim = min(len(texto), m.end() + 80)
+        contexto = texto[contexto_inicio:contexto_fim].lower()
+
+        # “paciente 51 anos” é um padrão muito típico
+        if "anos" in contexto and "paciente" in contexto:
+            score += 1
+
+        candidatos.append((idade, score))
+
+    if candidatos:
+        candidatos.sort(key=lambda x: x[1], reverse=True)
+        return candidatos[0][0]
+
+    # Fallback: se o LLM sugeriu algo razoável
+    if sugestao_llm is not None:
+        try:
+            idade = int(sugestao_llm)
+            if 15 <= idade <= 100:
+                return idade
+        except (TypeError, ValueError):
+            pass
+
+    return None
 
 
-def extrair_local_tumor(texto: str):
+def extrair_local_tumor(texto: str, contexto_cirurgia: Optional[str] = None):
     """Extrai localização do tumor. Prioriza menções diretas, depois tenta pela distância da borda anal."""
-    t = normalizar(texto)
+    texto_base = contexto_cirurgia if contexto_cirurgia else texto
+    t = normalizar(texto_base)
     
     # Mapeamento direto
     if "transicao retossigmoideana" in t or "transição retossigmoideana" in t:
@@ -394,132 +769,109 @@ def extrair_local_tumor(texto: str):
         except ValueError:
             pass
     
+    if contexto_cirurgia:
+        return extrair_local_tumor(texto, contexto_cirurgia=None)
     return None
 
 
-def extrair_ASA(texto: str, data_cirurgia: Optional[str] = None):
-    """Classificação ASA (1-4). OCR às vezes escreve 'ASAS' ao invés de 'ASA'. Procura em avaliação pré-op."""
-    t = normalizar(texto)
-    
-    # Procura especificamente em seções de avaliação pré-operatória
-    # Padrão comum: "Avaliação Prê-OP: ... ASA X"
-    secao_preop = ""
-    for match in re.finditer(r"avaliacao\s+pre[-\s]?op[^\n]{0,500}", t, re.IGNORECASE):
-        secao_preop += match.group(0) + " "
-    
-    # Se encontrou seção pré-op, procura lá primeiro
-    texto_busca = secao_preop if secao_preop else texto
-    
-    ocorrencias = encontrar_valores_com_contexto(
-        texto_busca,
-        r"asa[s]?\s*[:=]?\s*([1-4ivx]+)(?:\s|$|!|\.|!!)",
-        contexto_relevante=["pre", "operat", "cirurgia", "avaliacao", "risco", "pre-op"],
-        preferir_proximo_de=["cirurgia", "pre", "operat", "avaliacao", "pre-op"],
-        data_cirurgia=data_cirurgia
-    )
-    
-    # Se não encontrou na seção pré-op, procura no texto todo
-    if not ocorrencias:
-        ocorrencias = encontrar_valores_com_contexto(
-            texto,
-            r"asa[s]?\s*[:=]?\s*([1-4ivx]+)(?:\s|$|!|\.|!!)",
-            contexto_relevante=["pre", "operat", "cirurgia", "avaliacao", "risco", "pre-op"],
-            preferir_proximo_de=["cirurgia", "pre", "operat", "avaliacao", "pre-op"],
-            data_cirurgia=data_cirurgia
-        )
-    
-    # Se houver muitas ocorrências com scores similares, pergunta pro LLM
-    if len(ocorrencias) > 1:
-        top_scores = sorted([s for _, s in ocorrencias[:3]], reverse=True)
-        if len(top_scores) > 1 and top_scores[0] - top_scores[1] < 2:
-            resultado_llm = extrair_com_llm(texto, "ASA", "Classificação ASA pré-operatória na data da cirurgia principal (1-4)", "número inteiro entre 1 e 4")
-            if resultado_llm:
-                try:
-                    asa_llm = int(resultado_llm)
-                    if 1 <= asa_llm <= 4:
-                        return asa_llm
-                except:
-                    pass
-    
-    if not ocorrencias:
-        return None
-    
-    token = ocorrencias[0][0].strip()
-    token = re.sub(r'[^0-9ivx]', '', token.lower())
-    
-    # Converte romano para número
-    romano_para_num = {"i": 1, "ii": 2, "iii": 3, "iv": 4}
-    if token in romano_para_num:
-        return romano_para_num[token]
-    
+ROMANO_PARA_INT = {
+    "i": 1,
+    "ii": 2,
+    "iii": 3,
+    "iv": 4,
+    "v": 5,
+}
+
+def _converter_romano(valor: str) -> Optional[int]:
+    v = valor.strip().lower()
+    if v in ROMANO_PARA_INT:
+        return ROMANO_PARA_INT[v]
     try:
-        val = int(token)
-        if 1 <= val <= 4:
-            return val
+        num = int(v)
+        return num
     except ValueError:
-        pass
-    
+        return None
+
+def extrair_ASA(texto: str, sugestao_llm: Optional[int] = None) -> Optional[int]:
+    padrao = re.compile(r"asa\s*[:=]?\s*([ivx]+|\d)", re.IGNORECASE)
+    candidatos = []
+
+    for m in padrao.finditer(texto):
+        bruto = m.group(1)
+        valor = _converter_romano(bruto)
+        if valor is None:
+            continue
+        if valor < 1 or valor > 4:
+            continue
+
+        posicao = m.start()
+        score = 0
+
+        contexto = texto[max(0, posicao - 80): m.end() + 80].lower()
+        if "classificacao" in contexto or "risco" in contexto:
+            score += 2
+        else:
+            score += 1
+
+        candidatos.append((valor, score))
+
+    if candidatos:
+        candidatos.sort(key=lambda x: x[1], reverse=True)
+        return candidatos[0][0]
+
+    # Fallback LLM
+    if sugestao_llm is not None:
+        try:
+            valor = int(sugestao_llm)
+            if 1 <= valor <= 4:
+                return valor
+        except (TypeError, ValueError):
+            pass
+
     return None
 
 
-def extrair_ECOG(texto: str, data_cirurgia: Optional[str] = None):
-    """Performance Status ECOG (0-4). OCR às vezes escreve 'ECOq O' (letra O) ao invés de 'ECOG 0'."""
-    t = normalizar(texto)
-    
-    # Primeiro procura padrões explícitos "ECOG 0" ou "ECOG O" seguido de "Completamente ativo"
-    # Esse padrão é muito específico e confiável
-    match_especifico = re.search(r"ecog\s*[:=]?\s*([0o])\s+completamente\s+ativo", t, re.IGNORECASE)
-    if match_especifico:
-        return 0
-    
-    ocorrencias = encontrar_valores_com_contexto(
-        texto,
-        r"ecog\s*[:=]?\s*([0-4o])(?:\s|$|dl|completamente)",
-        contexto_relevante=["pre", "operat", "cirurgia", "avaliacao", "performance", "pre-op"],
-        preferir_proximo_de=["cirurgia", "pre", "operat", "performance", "avaliacao", "pre-op"],
-        data_cirurgia=data_cirurgia
-    )
-    
-    if len(ocorrencias) > 1:
-        top_scores = sorted([s for _, s in ocorrencias[:3]], reverse=True)
-        if len(top_scores) > 1 and top_scores[0] - top_scores[1] < 2:
-            resultado_llm = extrair_com_llm(texto, "ECOG", "Performance Status ECOG pré-operatório na data da cirurgia principal (0-4)", "número inteiro entre 0 e 4")
-            if resultado_llm:
-                try:
-                    ecog_llm = int(resultado_llm)
-                    if 0 <= ecog_llm <= 4:
-                        return ecog_llm
-                except:
-                    pass
-    
-    if not ocorrencias:
-        # Fallback: procura "ECOG" ou "Performance Status (ECOG)"
-        match = re.search(r"(?:ecog|performance\s+status.*?ecog)\s*[:=]?\s*([0-4o])(?:\s|$)", t, re.IGNORECASE)
-        if match:
-            val = match.group(1).lower()
-            if val == 'o':
-                return 0
-            try:
-                return int(val)
-            except:
-                pass
-        return None
-    
-    # Converte 'o' para 0
-    val = ocorrencias[0][0].lower()
-    if val == 'o':
-        return 0
-    try:
-        return int(val)
-    except:
-        return None
+def extrair_ECOG(texto: str, sugestao_llm: Optional[int] = None) -> Optional[int]:
+    padrao = re.compile(r"ecog\s*[:=]?\s*([0-4])", re.IGNORECASE)
+    candidatos = []
+
+    for m in padrao.finditer(texto):
+        try:
+            valor = int(m.group(1))
+        except ValueError:
+            continue
+
+        posicao = m.start()
+        score = 1
+
+        contexto = texto[max(0, posicao - 80): m.end() + 80].lower()
+        if "karnofsky" in contexto or "estado funcional" in contexto:
+            score += 1
+
+        candidatos.append((valor, score))
+
+    if candidatos:
+        candidatos.sort(key=lambda x: x[1], reverse=True)
+        return candidatos[0][0]
+
+    if sugestao_llm is not None:
+        try:
+            valor = int(sugestao_llm)
+            if 0 <= valor <= 4:
+                return valor
+        except (TypeError, ValueError):
+            pass
+
+    return None
 
 
-def extrair_KPS(texto: str, data_cirurgia: Optional[str] = None):
+
+def extrair_KPS(texto: str, data_cirurgia: Optional[str] = None, contexto_preop: Optional[str] = None):
     """Karnofsky Performance Status (0-100). OCR às vezes escreve 'KP5' ao invés de 'KPS'."""
-    t = normalizar(texto)
+    texto_preferencial = contexto_preop if contexto_preop else texto
+    t = normalizar(texto_preferencial)
     ocorrencias = encontrar_valores_com_contexto(
-        texto,
+        texto_preferencial,
         r"k[p]?s?\s*[:=]?\s*(\d{2,3})(?:\s|$|kg|%|bpm|mmHg)",
         contexto_relevante=["pre", "operat", "cirurgia", "performance", "karnofsky"],
         preferir_proximo_de=["karnofsky", "performance", "pre", "operat"],
@@ -527,15 +879,28 @@ def extrair_KPS(texto: str, data_cirurgia: Optional[str] = None):
     )
     
     if not ocorrencias:
-        match = re.search(r"(?:kps|karnofsky)\s*[:=]?\s*(\d{2,3})(?:\s|$|%)", t, re.IGNORECASE)
-        if match:
-            try:
-                val = int(match.group(1))
-                if 0 <= val <= 100:
-                    return val
-            except:
-                pass
-        return None
+        if contexto_preop:
+            t_full = normalizar(texto)
+            ocorrencias = encontrar_valores_com_contexto(
+                texto,
+                r"k[p]?s?\s*[:=]?\s*(\d{2,3})(?:\s|$|kg|%|bpm|mmHg)",
+                contexto_relevante=["pre", "operat", "cirurgia", "performance", "karnofsky"],
+                preferir_proximo_de=["karnofsky", "performance", "pre", "operat"],
+                data_cirurgia=data_cirurgia
+            )
+        else:
+            t_full = t
+        
+        if not ocorrencias:
+            match = re.search(r"(?:kps|karnofsky)\s*[:=]?\s*(\d{2,3})(?:\s|$|%)", t_full, re.IGNORECASE)
+            if match:
+                try:
+                    val = int(match.group(1))
+                    if 0 <= val <= 100:
+                        return val
+                except:
+                    pass
+            return None
     
     try:
         val = int(ocorrencias[0][0])
@@ -547,56 +912,53 @@ def extrair_KPS(texto: str, data_cirurgia: Optional[str] = None):
     return None
 
 
-def extrair_IMC(texto: str, data_cirurgia: Optional[str] = None):
+def extrair_IMC(texto: str, data_cirurgia: Optional[str] = None, contexto_preop: Optional[str] = None):
     """
     Extrai IMC. Prioriza valores pré-operatórios e próximos da data da cirurgia.
     Se houver muitas ocorrências com scores similares, usa LLM.
     """
-    t = normalizar(texto)
-    
     todas_ocorrencias = []
-    for match in re.finditer(r"imc\s*[:=]?\s*([0-9]{1,2}(?:[.,][0-9]{1,2})?)", t, re.IGNORECASE):
-        val_str = match.group(1).replace(",", ".")
-        try:
-            imc = float(val_str)
-            if not (10 <= imc <= 50):
-                continue
-            
-            pos = match.start()
-            antes = t[max(0, pos-500):pos]
-            depois = t[pos:min(len(t), pos+500)]
-            contexto = antes + depois
-            
-            score = 0
-            # Valores na faixa comum ganham pontos
-            if 20 <= imc <= 30:
-                score += 5
-            # Valores próximos de 24-25 (comum em pacientes oncológicos)
-            if 24 <= imc <= 25:
-                score += 3
-            
-            # Bonus se estiver em contexto pré-operatório
-            if any(palavra in contexto for palavra in ["pre", "operat", "cirurgia", "avaliacao", "pre-op"]):
-                score += 8
-            
-            if "peso" in contexto or "altura" in contexto:
-                score += 2
-            
-            # Bonus grande se estiver perto da data da cirurgia
-            if data_cirurgia:
-                padrao_data = data_cirurgia.replace("/", "[/-]")
-                if re.search(padrao_data, contexto):
-                    score += 15
-            
-            # Penaliza consultas de seguimento (não pré-op)
-            if "consulta" in contexto and "seguimento" in contexto:
-                score -= 3
-            
-            todas_ocorrencias.append((imc, score))
-        except ValueError:
-            continue
+    fontes_prioridade = []
+    if contexto_preop:
+        fontes_prioridade.append((contexto_preop, True))
+    fontes_prioridade.append((texto, False))
     
-    # Se houver muitas ocorrências com scores muito próximos, usa LLM
+    for fonte, bonus_preop in fontes_prioridade:
+        t = normalizar(fonte)
+        for match in re.finditer(r"imc\s*[:=]?\s*([0-9]{1,2}(?:[.,][0-9]{1,2})?)", t, re.IGNORECASE):
+            val_str = match.group(1).replace(",", ".")
+            try:
+                imc = float(val_str)
+                if not (10 <= imc <= 50):
+                    continue
+                
+                pos = match.start()
+                antes = t[max(0, pos-500):pos]
+                depois = t[pos:min(len(t), pos+500)]
+                contexto = antes + depois
+                
+                score = 0
+                if 20 <= imc <= 30:
+                    score += 5
+                if 24 <= imc <= 25:
+                    score += 3
+                if any(palavra in contexto for palavra in ["pre", "operat", "cirurgia", "avaliacao", "pre-op"]):
+                    score += 8
+                if "peso" in contexto or "altura" in contexto:
+                    score += 2
+                if data_cirurgia:
+                    padrao_data = data_cirurgia.replace("/", "[/-]")
+                    if re.search(padrao_data, contexto):
+                        score += 15
+                if "consulta" in contexto and "seguimento" in contexto:
+                    score -= 3
+                if bonus_preop:
+                    score += 2
+                
+                todas_ocorrencias.append((imc, score))
+            except ValueError:
+                continue
+    
     if len(todas_ocorrencias) > 3:
         top_scores = sorted([s for _, s in todas_ocorrencias], reverse=True)
         if len(top_scores) > 1 and top_scores[0] - top_scores[1] < 3:
@@ -613,14 +975,44 @@ def extrair_IMC(texto: str, data_cirurgia: Optional[str] = None):
         todas_ocorrencias.sort(key=lambda x: x[1], reverse=True)
         return round(todas_ocorrencias[0][0], 1)
     
-    # Fallback: tenta calcular a partir de peso e altura
-    pesos = []
-    alturas = []
+    # Fallback: tenta calcular a partir de peso e altura (prioriza contexto pré-op)
+    fontes_para_calculo = []
+    if contexto_preop:
+        fontes_para_calculo.append(contexto_preop)
+    fontes_para_calculo.append(texto)
     
-    for match in re.finditer(r"peso\)?\s*[:=]?\s*([0-9]{2,3}(?:[.,][0-9])?)", t):
-        try:
-            peso = float(match.group(1).replace(",", "."))
-            if 30 <= peso <= 150:
+    for fonte in fontes_para_calculo:
+        t = normalizar(fonte)
+        pesos = []
+        alturas = []
+        
+        for match in re.finditer(r"peso\)?\s*[:=]?\s*([0-9]{2,3}(?:[.,][0-9])?)", t):
+            try:
+                peso = float(match.group(1).replace(",", "."))
+                if 30 <= peso <= 150:
+                    inicio = max(0, match.start() - 100)
+                    contexto = t[inicio:match.start()]
+                    score = 0
+                    if "pre" in contexto or "operat" in contexto:
+                        score += 2
+                    if "cirurgia" in contexto:
+                        score += 1
+                    if fonte is contexto_preop:
+                        score += 1
+                    pesos.append((peso, score))
+            except ValueError:
+                continue
+        
+        for match in re.finditer(r"altura\)?\s*[:=]?\s*([0-9]{1,3}(?:[.,][0-9]{1,2})?)", t):
+            try:
+                altura_str = match.group(1).replace(",", ".")
+                if "." in altura_str and 1.0 <= float(altura_str) <= 2.2:
+                    altura = float(altura_str)
+                elif 100 <= float(altura_str) <= 220:
+                    altura = float(altura_str) / 100
+                else:
+                    continue
+                
                 inicio = max(0, match.start() - 100)
                 contexto = t[inicio:match.start()]
                 score = 0
@@ -628,41 +1020,20 @@ def extrair_IMC(texto: str, data_cirurgia: Optional[str] = None):
                     score += 2
                 if "cirurgia" in contexto:
                     score += 1
-                pesos.append((peso, score))
-        except ValueError:
-            continue
-    
-    for match in re.finditer(r"altura\)?\s*[:=]?\s*([0-9]{1,3}(?:[.,][0-9]{1,2})?)", t):
-        try:
-            altura_str = match.group(1).replace(",", ".")
-            # Se está em metros (1.50-2.20)
-            if "." in altura_str and 1.0 <= float(altura_str) <= 2.2:
-                altura = float(altura_str)
-            # Se está em cm (100-220)
-            elif 100 <= float(altura_str) <= 220:
-                altura = float(altura_str) / 100
-            else:
+                if fonte is contexto_preop:
+                    score += 1
+                alturas.append((altura, score))
+            except ValueError:
                 continue
-            
-            inicio = max(0, match.start() - 100)
-            contexto = t[inicio:match.start()]
-            score = 0
-            if "pre" in contexto or "operat" in contexto:
-                score += 2
-            if "cirurgia" in contexto:
-                score += 1
-            alturas.append((altura, score))
-        except ValueError:
-            continue
-    
-    if pesos and alturas:
-        pesos.sort(key=lambda x: x[1], reverse=True)
-        alturas.sort(key=lambda x: x[1], reverse=True)
-        p = pesos[0][0]
-        h = alturas[0][0]
-        imc = p / (h * h)
-        if 10 <= imc <= 50:
-            return round(imc, 1)
+        
+        if pesos and alturas:
+            pesos.sort(key=lambda x: x[1], reverse=True)
+            alturas.sort(key=lambda x: x[1], reverse=True)
+            p = pesos[0][0]
+            h = alturas[0][0]
+            imc = p / (h * h)
+            if 10 <= imc <= 50:
+                return round(imc, 1)
     
     return None
 
@@ -693,32 +1064,50 @@ def extrair_eletiva(texto: str):
     return 1
 
 
-def extrair_altura_tumor(texto: str):
-    """Altura do tumor em cm. Pode estar como '99' (não aplicável) ou valor real."""
-    t = normalizar(texto)
-    padroes = [
-        r"altura\s+tumor\s*[:]?\s*(\d{1,3}(?:[.,]\d+)?)\s*cm",
-        r"altura\s*[:]?\s*(\d{1,3}(?:[.,]\d+)?)\s*cm.*?tumor",
-        r"distancia.*?borda\s+anal.*?(\d{1,2}(?:[.,]\d+)?)\s*cm",  # Distância da borda anal
-    ]
-    for padrao in padroes:
-        match = re.search(padrao, t, re.IGNORECASE)
-        if match:
+def extrair_altura_tumor(texto: str) -> Optional[int]:
+    candidatos = []
+
+    padrao1 = re.compile(
+        r"(\d{1,2})\s*cm\s*(?:da\s+)?borda\s+anal",
+        re.IGNORECASE,
+    )
+    padrao2 = re.compile(
+        r"altura\s+(?:do\s+)?tumor\s*[:=]?\s*(\d{1,2})\s*cm",
+        re.IGNORECASE,
+    )
+
+    for padrao in [padrao1, padrao2]:
+        for m in padrao.finditer(texto):
             try:
-                altura = float(match.group(1).replace(",", "."))
-                # Se for 99, pode ser código de "não aplicável"
-                if altura == 99:
-                    return 99
-                if 0 < altura <= 50:  # Validação razoável
-                    return altura
-            except:
-                pass
-    return None
+                valor = int(m.group(1))
+            except ValueError:
+                continue
+
+            # Faixa razoável de altura em cm
+            if valor < 0 or valor > 30:
+                continue
+
+            posicao = m.start()
+            score = 1
+
+            contexto = texto[max(0, posicao - 80): m.end() + 80].lower()
+            if "reto" in contexto:
+                score += 1
+
+            candidatos.append((valor, score))
+
+    if not candidatos:
+        return None
+
+    candidatos.sort(key=lambda x: x[1], reverse=True)
+    return candidatos[0][0]
 
 
-def extrair_cirurgia_recidiva(texto: str):
+
+def extrair_cirurgia_recidiva(texto: str, contexto_cirurgia: Optional[str] = None):
     """0 = não, 1 = sim, 88 = não aplicável. Verifica se a cirurgia foi por recidiva."""
-    t = normalizar(texto)
+    texto_base = contexto_cirurgia if contexto_cirurgia else texto
+    t = normalizar(texto_base)
     # Procura padrões específicos de cirurgia por recidiva
     if "exentera" in t and "recidiva" in t:
         return 1
@@ -731,6 +1120,8 @@ def extrair_cirurgia_recidiva(texto: str):
         if "nao" in contexto or "sem" in contexto:
             return 0
         return 1
+    if contexto_cirurgia:
+        return extrair_cirurgia_recidiva(texto, contexto_cirurgia=None)
     # Se não menciona recidiva em contexto cirúrgico, pode ser 88 (não aplicável)
     return None
 
@@ -950,44 +1341,81 @@ def extrair_SLE(texto: str):
     return 0
 
 
-def extrair_REC_plastica(texto: str):
-    """Reconstrução com plástica: 0 = não, 1 = sim. Verifica se é reconstrução urológica."""
-    t = normalizar(texto)
-    # "Duplo J" ou "nefrostomia" são tipos de reconstrução, mas não necessariamente plástica
-    if "reconstrucao" in t and "plastica" in t:
+def extrair_REC_plastica(texto: str) -> Optional[int]:
+    texto_lower = texto.lower()
+
+    if "retalho" in texto_lower or "plast" in texto_lower or "reconstrucao" in texto_lower:
         return 1
-    if "reconstrucao" in t and "gregoir" in t:  # Gregoir é tipo de reconstrução
-        return 1
-    # Se só menciona "plastica" sem contexto de reconstrução, pode ser outra coisa
+
+    # Se não achar nada que pareça plástica, considera que não teve
     return 0
 
 
-def extrair_tipo_REC(texto: str):
-    """Tipo de reconstrução: 0=briker, 1=duplo barril, 2=duplo barril ileal, 3=nefrostomia"""
-    t = normalizar(texto)
+def extrair_tipo_REC(texto: str) -> Optional[int]:
+    texto_lower = texto.lower()
+
+    # Os códigos exatos você pode ajustar se tiver um dicionário da planilha
+    if "retalho miocutaneo" in texto_lower:
+        return 1
+    if "retalho cutaneo" in texto_lower:
+        return 2
+    if "retalho local" in texto_lower or "avancamento" in texto_lower:
+        return 3
+
+    # 88 = não se aplica / não foi feita plástica
+    return 88
+
+def extrair_tipo_rec_uro(texto: str) -> Optional[int]:
+    texto_lower = texto.lower()
+
+    if "bricker" in texto_lower:
+        return 0
+    if "duplo barril ileal" in texto_lower:
+        return 2
+    if "duplo barril" in texto_lower:
+        return 1
+    if "nefrostomia" in texto_lower:
+        return 3
+
+    # 88 = nada disso se aplica
+    return 88
+
+
+def extrair_tempo_SO(
+    data_cirurgia: Optional[str] = None,
+    dt_alta: Optional[str] = None,
+    dt_ult_consulta: Optional[str] = None,
+    dt_obito: Optional[str] = None,
+) -> Optional[int]:
+    """Calcula tempo em dias desde a cirurgia até o último acompanhamento/óbito/alta."""
+    if not data_cirurgia:
+        return None
     
-    # Procura padrões específicos
-    if "nefrostomia" in t:
-        return "3"
-    if "duplo barril ileal" in t:
-        return "2"
-    if "duplo barril" in t or "duplo j" in t:
-        return "1"
-    if "briker" in t or "bricker" in t:
-        return "0"
+    try:
+        dt_cir = datetime.strptime(data_cirurgia.replace("-", "/"), "%d/%m/%Y")
+    except Exception:
+        return None
     
-    # Se menciona "gregoir" pode ser tipo de reconstrução, mas não está no mapeamento
+    referencias = []
+    for dt_str in [dt_obito, dt_ult_consulta, dt_alta]:
+        if not dt_str:
+            continue
+        try:
+            dt_ref = datetime.strptime(dt_str.replace("-", "/"), "%d/%m/%Y")
+            if dt_ref >= dt_cir:
+                referencias.append((dt_ref - dt_cir).days)
+        except Exception:
+            continue
+    
+    if referencias:
+        return max(referencias)
     return None
 
 
-def extrair_tempo_SO(texto: str, data_cirurgia: Optional[str] = None):
-    """Tempo desde SO em dias - precisa data atual, por enquanto retorna None"""
-    return None
-
-
-def extrair_CH_intra_OP(texto: str):
+def extrair_CH_intra_OP(texto: str, contexto_cirurgia: Optional[str] = None):
     """Quimioterapia intra-operatória: 0 = não, 1 = sim. Verifica se realmente foi durante a cirurgia."""
-    t = normalizar(texto)
+    texto_base = contexto_cirurgia if contexto_cirurgia else texto
+    t = normalizar(texto_base)
     # Procura padrões específicos de quimioterapia intra-operatória
     if "quimio" in t and "intra" in t and "operat" in t:
         # Verifica se não é negação
@@ -995,12 +1423,15 @@ def extrair_CH_intra_OP(texto: str):
         contexto = t[max(0, idx-50):min(len(t), idx+50)]
         if "nao" not in contexto:
             return 1
+    if contexto_cirurgia:
+        return extrair_CH_intra_OP(texto, contexto_cirurgia=None)
     return 0
 
 
-def extrair_CH_num(texto: str):
+def extrair_CH_num(texto: str, contexto_cirurgia: Optional[str] = None):
     """Número de ciclos de quimioterapia. Procura em contexto de QT neoadjuvante/adjuvante."""
-    t = normalizar(texto)
+    texto_base = contexto_cirurgia if contexto_cirurgia else texto
+    t = normalizar(texto_base)
     
     # Procura padrões específicos
     padroes = [
@@ -1019,71 +1450,174 @@ def extrair_CH_num(texto: str):
             except:
                 pass
     
+    if contexto_cirurgia:
+        return extrair_CH_num(texto, contexto_cirurgia=None)
     return None
 
 
-def extrair_dias_uti(texto: str):
-    """Dias de UTI. Procura em evoluções de internação."""
-    t = normalizar(texto)
+def extrair_dias_uti(texto: str, data_cirurgia: Optional[str] = None, contexto_internacao: Optional[str] = None):
+    """Dias de UTI. MELHORADO: Busca mais agressiva com contexto da cirurgia."""
+    texto_base = contexto_internacao if contexto_internacao else texto
+    t = normalizar(texto_base)
+    
+    # Padrões mais flexíveis
     padroes = [
         r"dias\s+uti\s*[:]?\s*(\d+)",
         r"uti\s*[:]?\s*(\d+)\s+dias",
         r"permanencia.*?uti.*?(\d+)\s+dias",
+        r"uti.*?(\d+)\s+dias",
+        r"admissao.*?uti.*?(\d+)\s+dias",
     ]
+    
+    candidatos = []
+    
     for padrao in padroes:
-        match = re.search(padrao, t, re.IGNORECASE)
-        if match:
+        matches = list(re.finditer(padrao, t, re.IGNORECASE))
+        for match in matches:
             try:
                 dias = int(match.group(1))
-                if 0 <= dias <= 365:  # Validação razoável
-                    return dias
+                if 0 <= dias <= 365:
+                    # Contexto ao redor
+                    contexto = texto_base[max(0, match.start()-2000):match.end()+2000].lower()
+                    score = 10
+                    
+                    # Prioriza se está próximo da data da cirurgia
+                    if data_cirurgia:
+                        if data_cirurgia[:7] in contexto or data_cirurgia.split("/")[2] in contexto:
+                            score += 20
+                    
+                    # Prioriza se menciona exenteração
+                    if "exentera" in contexto:
+                        score += 15
+                    
+                    candidatos.append((dias, score, match.start()))
             except:
                 pass
+    
+    if candidatos:
+        candidatos.sort(key=lambda x: x[1], reverse=True)
+        return candidatos[0][0]
+    
+    if contexto_internacao:
+        return extrair_dias_uti(texto, data_cirurgia, contexto_internacao=None)
     return None
 
 
-def extrair_dias_internacao(texto: str):
-    """Dias de internação. Pode calcular pela diferença entre entrada e alta."""
-    t = normalizar(texto)
+def extrair_dias_internacao(texto: str, data_cirurgia: Optional[str] = None, contexto_internacao: Optional[str] = None):
+    """Dias de internação. MELHORADO: Busca mais agressiva com contexto da cirurgia."""
+    texto_base = contexto_internacao if contexto_internacao else texto
+    t = normalizar(texto_base)
     
-    # Tenta calcular pela diferença de datas
-    padrao_entrada = r"entrada[:\s]+(\d{2}/\d{2}/\d{4})"
-    padrao_alta = r"alta[:\s]+(\d{2}/\d{2}/\d{4})"
+    # Tenta calcular pela diferença de datas (mais flexível)
+    padroes_entrada = [
+        r"entrada[:\s]+(\d{2}[/-]\d{2}[/-]\d{4})",
+        r"admissao[:\s]+(\d{2}[/-]\d{2}[/-]\d{4})",
+        r"internacao[:\s]+(\d{2}[/-]\d{2}[/-]\d{4})",
+    ]
+    padroes_alta = [
+        r"alta[:\s]+(\d{2}[/-]\d{2}[/-]\d{4})",
+        r"dt\s*alta[:\s]+(\d{2}[/-]\d{2}[/-]\d{4})",
+        r"data\s+alta[:\s]+(\d{2}[/-]\d{2}[/-]\d{4})",
+    ]
     
-    match_entrada = re.search(padrao_entrada, t, re.IGNORECASE)
-    match_alta = re.search(padrao_alta, t, re.IGNORECASE)
+    # Busca entrada e alta próximos da cirurgia
+    match_entrada = None
+    match_alta = None
     
+    if data_cirurgia:
+        # Procura entrada e alta próximos da data da cirurgia
+        padrao_data = re.escape(data_cirurgia.replace("/", "[/-]"))
+        matches_data = list(re.finditer(padrao_data, texto, re.IGNORECASE))
+        
+        if matches_data:
+            # Pega contexto ao redor da data da cirurgia
+            idx_cir = matches_data[0].start()
+            contexto_cir = texto[max(0, idx_cir-50000):min(len(texto), idx_cir+100000)]
+            
+            for padrao in padroes_entrada:
+                match = re.search(padrao, contexto_cir, re.IGNORECASE)
+                if match:
+                    match_entrada = match
+                    break
+            
+            for padrao in padroes_alta:
+                match = re.search(padrao, contexto_cir, re.IGNORECASE)
+                if match:
+                    match_alta = match
+                    break
+    
+    # Se não encontrou com contexto, busca em todo o texto
+    if not match_entrada:
+        for padrao in padroes_entrada:
+            match = re.search(padrao, t, re.IGNORECASE)
+            if match:
+                match_entrada = match
+                break
+    
+    if not match_alta:
+        for padrao in padroes_alta:
+            match = re.search(padrao, t, re.IGNORECASE)
+            if match:
+                match_alta = match
+                break
+    
+    # Calcula diferença se encontrou ambas
     if match_entrada and match_alta:
         try:
-            dt_entrada = datetime.strptime(match_entrada.group(1), "%d/%m/%Y")
-            dt_alta = datetime.strptime(match_alta.group(1), "%d/%m/%Y")
+            dt_entrada = datetime.strptime(match_entrada.group(1).replace("-", "/"), "%d/%m/%Y")
+            dt_alta = datetime.strptime(match_alta.group(1).replace("-", "/"), "%d/%m/%Y")
             dias = (dt_alta - dt_entrada).days
             if 0 <= dias <= 365:
                 return dias
         except:
             pass
     
-    # Fallback: procura padrões diretos
+    # Fallback: procura padrões diretos (mais flexíveis)
     padroes = [
+        r"dias\s+de\s+internacao\s*[:]?\s*(\d+)",
         r"dias\s+internacao\s*[:]?\s*(\d+)",
         r"internacao\s*[:]?\s*(\d+)\s+dias",
         r"permanencia.*?(\d+)\s+dias",
+        r"(\d+)\s+dias\s+de\s+internacao",
     ]
+    
+    candidatos = []
     for padrao in padroes:
-        match = re.search(padrao, t, re.IGNORECASE)
-        if match:
+        matches = list(re.finditer(padrao, t, re.IGNORECASE))
+        for match in matches:
             try:
                 dias = int(match.group(1))
                 if 0 <= dias <= 365:
-                    return dias
+                    # Contexto ao redor
+                    contexto = texto_base[max(0, match.start()-2000):match.end()+2000].lower()
+                    score = 10
+                    
+                    # Prioriza se está próximo da data da cirurgia
+                    if data_cirurgia:
+                        if data_cirurgia[:7] in contexto or data_cirurgia.split("/")[2] in contexto:
+                            score += 20
+                    
+                    # Prioriza se menciona exenteração
+                    if "exentera" in contexto:
+                        score += 15
+                    
+                    candidatos.append((dias, score, match.start()))
             except:
                 pass
+    
+    if candidatos:
+        candidatos.sort(key=lambda x: x[1], reverse=True)
+        return candidatos[0][0]
+    
+    if contexto_internacao:
+        return extrair_dias_internacao(texto, data_cirurgia, contexto_internacao=None)
     return None
 
 
-def extrair_dt_alta(texto: str):
+def extrair_dt_alta(texto: str, contexto_internacao: Optional[str] = None):
     """Data de alta"""
-    t = normalizar(texto)
+    texto_base = contexto_internacao if contexto_internacao else texto
+    t = normalizar(texto_base)
     padroes = [
         r"dt\s*alta\s*[:]?\s*(\d{2}[/-]\d{2}[/-]\d{4})",
         r"data\s+alta\s*[:]?\s*(\d{2}[/-]\d{2}[/-]\d{4})",
@@ -1093,6 +1627,8 @@ def extrair_dt_alta(texto: str):
         match = re.search(padrao, t, re.IGNORECASE)
         if match:
             return match.group(1).replace("-", "/")
+    if contexto_internacao:
+        return extrair_dt_alta(texto, contexto_internacao=None)
     return None
 
 
@@ -1131,24 +1667,24 @@ def extrair_tto(texto: str):
     return None
 
 
-def extrair_Clavien(texto: str):
-    """Classificação de Clavien (0-5)"""
-    t = normalizar(texto)
-    match = re.search(r"clavien\s*[:]?\s*([0-5])", t, re.IGNORECASE)
-    if match:
-        return match.group(1)
-    return None
+def extrair_Clavien(texto: str) -> Optional[int]:
+    texto_lower = texto.lower()
+    padrao = re.compile(r"clavien\s*([0-5])", re.IGNORECASE)
 
-
-def extrair_Clavien_v2(texto: str):
-    """Classificação de Clavien v2 (numérico)"""
-    clavien = extrair_Clavien(texto)
-    if clavien:
+    for m in padrao.finditer(texto):
         try:
-            return int(clavien)
-        except:
-            pass
-    return None
+            valor = int(m.group(1))
+            return valor
+        except ValueError:
+            continue
+
+    # Se não aparece grau claramente, assume sem complicação maior
+    return 0
+
+
+def extrair_Clavien_v2(texto: str) -> Optional[int]:
+    return extrair_Clavien(texto)
+
 
 
 def extrair_reinternacao(texto: str):
@@ -1191,33 +1727,38 @@ def extrair_motivo_reinternacao(texto: str):
     return None
 
 
-def extrair_re_op_90dias(texto: str):
-    """Reoperação em 90 dias: 0 = não, 1 = sim. Verifica se há múltiplas cirurgias próximas."""
-    t = normalizar(texto)
-    # Procura por múltiplas cirurgias com datas próximas
-    padrao_cirurgia = r"(?:po|cirurgia|operacao).*?(\d{2}/\d{2}/\d{4})"
-    cirurgias = list(re.finditer(padrao_cirurgia, t, re.IGNORECASE))
-    
-    if len(cirurgias) > 1:
-        # Verifica se há cirurgias com menos de 90 dias de diferença
-        datas_cir = []
-        for match in cirurgias:
-            try:
-                dt = datetime.strptime(match.group(1), "%d/%m/%Y")
-                datas_cir.append(dt)
-            except:
-                continue
-        
-        if len(datas_cir) > 1:
-            datas_cir.sort()
-            for i in range(len(datas_cir) - 1):
-                diff = (datas_cir[i+1] - datas_cir[i]).days
-                if 0 < diff <= 90:
-                    return 1
-    
-    if "reoperacao" in t or "re-op" in t or "reoperacao" in t:
-        return 1
+def extrair_re_op_90dias(
+    texto: str,
+    data_cirurgia: Optional[datetime] = None,
+) -> Optional[int]:
+    texto_lower = texto.lower()
+
+    if (
+        "reoperacao" not in texto_lower
+        and "reoperado" not in texto_lower
+        and "re-operacao" not in texto_lower
+    ):
+        return 0
+
+    janela = 200
+    termos_base = ["reoperacao", "reoperado", "re-operacao"]
+    gatilhos_90 = ["90 dias", "noventa dias", "3 meses", "tres meses", "ate 90", "até 90"]
+
+    for termo in termos_base:
+        idx = texto_lower.find(termo)
+        if idx == -1:
+            continue
+
+        inicio = max(0, idx - janela)
+        fim = min(len(texto_lower), idx + janela)
+        contexto = texto_lower[inicio:fim]
+
+        for gatilho in gatilhos_90:
+            if gatilho in contexto:
+                return 1
+
     return 0
+
 
 
 def extrair_re_op_achado(texto: str):
@@ -1248,31 +1789,39 @@ def extrair_histologia(texto: str):
     return None
 
 
-def extrair_AP(texto: str):
-    """Anatomia patológica (estadiamento TNM). Procura em laudos de AP."""
-    t = normalizar(texto)
-    
-    # Procura especificamente em seções de AP/anatomia patológica
-    # Padrões mais específicos primeiro
-    padroes = [
-        r"p?t([0-4][a-cb]?)\s+p?n([0-3][a-cb]?)\s+p?m([0-1][a-cb]?)",  # pT4b pN1b pM0
-        r"t([0-4][a-cb]?)\s+n([0-3][a-cb]?)\s+m([0-1][a-cb]?)",  # T4b N1b M0
-        r"ap[:\s]+.*?p?t([0-4][a-cb]?)\s+p?n([0-3][a-cb]?)\s+p?m([0-1][a-cb]?)",  # AP: pT4b pN1b
-    ]
-    
-    for padrao in padroes:
-        match = re.search(padrao, t, re.IGNORECASE)
-        if match:
-            t_val = match.group(1).upper()
-            n_val = match.group(2).upper()
-            m_val = match.group(3).upper() if len(match.groups()) > 2 else "X"
-            # Prioriza formato com "p" se encontrou
-            if "p" in padrao or "p" in match.group(0).lower():
-                return f"pT{t_val} pN{n_val} pM{m_val}"
-            else:
-                return f"T{t_val} N{n_val} M{m_val}"
-    
+def extrair_AP(texto: str, sugestao_llm: Optional[str] = None) -> Optional[str]:
+    padrao = re.compile(
+        r"p\s*t\s*([0-4][abc]?)\s+p\s*n\s*([0-3][abc]?)",
+        re.IGNORECASE,
+    )
+
+    candidatos = []
+
+    for m in padrao.finditer(texto):
+        t = m.group(1)
+        n = m.group(2)
+        valor = f"pt{t} pn{n}".lower()
+
+        posicao = m.start()
+        score = 1
+
+        contexto = texto[max(0, posicao - 120): m.end() + 120].lower()
+        if "anatomopatologico" in contexto or "patologico" in contexto or "laudo" in contexto:
+            score += 2
+
+        candidatos.append((valor, score))
+
+    if candidatos:
+        candidatos.sort(key=lambda x: x[1], reverse=True)
+        return candidatos[0][0]
+
+    if sugestao_llm:
+        s = str(sugestao_llm).strip().lower()
+        if "pt" in s and "pn" in s:
+            return s
+
     return None
+
 
 
 def extrair_estadiamento(texto: str):
@@ -1581,122 +2130,307 @@ def extrair_observacao(texto: str):
 
 
 def extrair_campos_por_regras(texto: str, registros: List[Dict] = None) -> dict:
-    """Chama todos os extratores e monta o dicionário com todos os campos."""
+    """
+    Estratégia híbrida em duas camadas:
+    1) extrai um primeiro palpite global com LLM (campos mais complexos).
+    2) aplica regex/heurísticas para todos os campos, usando as sugestões do LLM
+       apenas como apoio (quando fizer sentido).
+    """
+    # 1) Âncora temporal: data da cirurgia vinda do texto cru
     data_cirurgia = extrair_data_cirurgia(texto)
-    
-    resultado = {
-        "sexo": extrair_sexo(texto),
-        "dt_SO": data_cirurgia,
-        "idade": extrair_idade(texto, data_cirurgia),
-        "local_tumor": extrair_local_tumor(texto),
-        "altura_tumor": extrair_altura_tumor(texto),
-        "ASA": extrair_ASA(texto, data_cirurgia),
-        "ECOG": extrair_ECOG(texto, data_cirurgia),
-        "KPS": extrair_KPS(texto, data_cirurgia),
-        "IMC": extrair_IMC(texto, data_cirurgia),
-        "QRT_neo": extrair_QRT_neo(texto),
-        "eletiva": extrair_eletiva(texto),
-        "cirurgia_recidiva": extrair_cirurgia_recidiva(texto),
-        "paliativa": extrair_paliativa(texto),
-    }
-    
-    # Órgãos envolvidos
+
+    # 2) Chama LLM para um primeiro palpite dos campos principais
+    resultado_llm = extrair_campos_criticos_llm(texto, data_cirurgia) or {}
+
+    # Se LLM deu dt_SO, usa como data principal (ajusta variação de OCR)
+    if resultado_llm.get("dt_SO"):
+        data_cirurgia = resultado_llm["dt_SO"]
+
+    # 3) Parte puramente de regras/regex (inclusive campos sem LLM)
+    return extrair_campos_regex(
+        texto=texto,
+        resultado_llm=resultado_llm,
+        data_cirurgia=data_cirurgia,
+        registros=registros,
+    )
+
+def extrair_campos_regex(
+    texto: str,
+    resultado_llm: Dict[str, Any],
+    data_cirurgia: Optional[str],
+    registros: List[Dict] = None,
+) -> dict:
+    """
+    Parte puramente de regras/regex.
+    Recebe as sugestões do LLM e a data da cirurgia já resolvida,
+    e devolve o dicionário `resultado` com todos os campos.
+    """
+    # 3) Contextos úteis (pré-op, cirurgia, internação)
+    contextos = construir_contextos_cirurgia(texto, data_cirurgia)
+    contexto_preop = contextos.get("preop") or None
+    contexto_cirurgia = contextos.get("cirurgia") or None
+    contexto_internacao = contextos.get("internacao") or None
+
+    # 4) Começa o dicionário final
+    resultado: Dict[str, Any] = {}
+
+    # ------------------------------------------------------------------
+    # BLOCO: Campos básicos / pré-operatórios
+    # ------------------------------------------------------------------
+
+    # sexo: se LLM falhar, usa regex simples
+    resultado["sexo"] = resultado_llm.get("sexo") or extrair_sexo(texto)
+
+    # dt_SO: LLM ou regex
+    resultado["dt_SO"] = resultado_llm.get("dt_SO") or data_cirurgia
+
+    # idade: queremos confiar mais na regex do que no LLM
+    resultado["idade"] = extrair_idade(
+        texto,
+        data_cirurgia=data_cirurgia,
+        sugestao_llm=resultado_llm.get("idade"),
+    )
+
+    # ASA: regex primeiro, LLM só como sugestão
+    resultado["ASA"] = extrair_ASA(
+        texto,
+        sugestao_llm=resultado_llm.get("ASA") or resultado_llm.get("asa"),
+    )
+
+    # ECOG: mesmo esquema
+    resultado["ECOG"] = extrair_ECOG(
+        texto,
+        sugestao_llm=resultado_llm.get("ECOG") or resultado_llm.get("ecog"),
+    )
+
+    # IMC: aqui mantemos a sua lógica antiga (regex com contexto),
+    # usando o valor do LLM só se regex não achar nada
+    imc_llm = resultado_llm.get("IMC")
+    imc_regex = extrair_IMC(texto, data_cirurgia, contexto_preop)
+    resultado["IMC"] = imc_regex if imc_regex is not None else imc_llm
+
+    # KPS: LLM primeiro, regex como fallback
+    kps_llm = resultado_llm.get("KPS")
+    kps_regex = extrair_KPS(texto, data_cirurgia, contexto_preop)
+    resultado["KPS"] = kps_llm if kps_llm is not None else kps_regex
+
+    # local_tumor: LLM ou regex
+    resultado["local_tumor"] = (
+        resultado_llm.get("local_tumor")
+        or extrair_local_tumor(texto, contexto_cirurgia)
+    )
+
+    # altura_tumor: regex (borda anal / altura do tumor)
+    resultado["altura_tumor"] = extrair_altura_tumor(texto)
+
+    # QRT_neo / eletiva / paliativa: mantém regex simples
+    resultado["QRT_neo"] = resultado_llm.get("QRT_neo") or extrair_QRT_neo(texto)
+    resultado["eletiva"] = resultado_llm.get("eletiva") or extrair_eletiva(texto)
+    resultado["paliativa"] = resultado_llm.get("paliativa") or extrair_paliativa(texto)
+
+    # cirurgia_recidiva: LLM ou regex
+    resultado["cirurgia_recidiva"] = (
+        resultado_llm.get("cirurgia_recidiva")
+        or extrair_cirurgia_recidiva(texto, contexto_cirurgia)
+    )
+
+    # ------------------------------------------------------------------
+    # BLOCO: Patologia / AP / Estadiamento
+    # ------------------------------------------------------------------
+
+    # AP: queremos um valor limpo tipo "pt4b pn1b"
+    resultado["AP"] = extrair_AP(
+        texto,
+        sugestao_llm=resultado_llm.get("AP") or resultado_llm.get("ap"),
+    )
+
+    # Se AP vier preenchido, tenta derivar T / N / N_A a partir dele
+    if resultado.get("AP"):
+        ap_val = str(resultado["AP"]).lower()
+
+        # T a partir de "pt4b"
+        match_t = re.search(r"t([0-4][abc]?)", ap_val, re.IGNORECASE)
+        if match_t:
+            resultado["T"] = f"T{match_t.group(1).upper()}"
+
+        # N a partir de "pn1b"
+        match_n = re.search(r"n([0-3][abc]?)", ap_val, re.IGNORECASE)
+        if match_n:
+            n_val = f"N{match_n.group(1).upper()}"
+            # tenta refinar com N no formato "2/26" se existir
+            resultado["N"] = extrair_N(texto) or n_val
+
+        # N_A: se N veio como "2/26", pega o numerador
+        if resultado.get("N") and "/" in str(resultado["N"]):
+            try:
+                n_a = int(str(resultado["N"]).split("/")[0])
+                resultado["N_A"] = n_a
+            except Exception:
+                pass
+
+    # Fallbacks se ainda faltar alguma coisa
+    if resultado.get("estadiamento") is None:
+        resultado["estadiamento"] = (
+            resultado_llm.get("estadiamento") or extrair_estadiamento(texto)
+        )
+
+    if resultado.get("T") is None:
+        resultado["T"] = extrair_T(texto)
+
+    if resultado.get("N") is None:
+        resultado["N"] = extrair_N(texto)
+
+    if resultado.get("N_A") is None:
+        resultado["N_A"] = extrair_N_A(texto)
+
+    # ------------------------------------------------------------------
+    # BLOCO: Internação / UTI / Alta
+    # ------------------------------------------------------------------
+
+    # dias de internação e UTI: regex com ajuda da data de cirurgia
+    resultado["dias_internação"] = (
+        resultado_llm.get("dias_internação")
+        or extrair_dias_internacao(texto, data_cirurgia, contexto_internacao)
+    )
+
+    resultado["dias_uti"] = (
+        resultado_llm.get("dias_uti")
+        or extrair_dias_uti(texto, data_cirurgia, contexto_internacao)
+    )
+
+    # dt_alta: regex a partir do contexto de internação
+    resultado["dt_alta"] = (
+        resultado_llm.get("dt_alta") or extrair_dt_alta(texto, contexto_internacao)
+    )
+
+    # BLOCO: Órgãos envolvidos e cirurgias associadas
+
     orgaos = extrair_orgaos_envolvidos(texto)
     resultado.update(orgaos)
     resultado["bexiga_tudo"] = extrair_bexiga_tudo(texto)
     resultado["bexiga_parte"] = extrair_bexiga_parte(texto)
-    
     outro_orgao, outro_orgao_qual = extrair_outro_orgao(texto)
     resultado["outro_orgao"] = outro_orgao
     resultado["outro_orgao_qual"] = outro_orgao_qual
     resultado["n_orgaos"] = extrair_n_orgaos(texto, orgaos)
-    
-    # Campos cirúrgicos
-    resultado.update({
-        "amputação": extrair_amputacao(texto),
-        "RTS": extrair_RTS(texto),
-        "cole_total": extrair_cole_total(texto),
-        "posterior": extrair_posterior(texto),
-        "total": extrair_total(texto),
-        "SLE": extrair_SLE(texto),
-        "REC_plastica": extrair_REC_plastica(texto),
-        "tipo_REC": extrair_tipo_REC(texto),
-        "tempo_SO": extrair_tempo_SO(texto, data_cirurgia),
-        "CH_intra_OP": extrair_CH_intra_OP(texto),
-        "CH_num": extrair_CH_num(texto),
-        "dias_uti": extrair_dias_uti(texto),
-        "dias_internação": extrair_dias_internacao(texto),
-        "dt_alta": extrair_dt_alta(texto),
-        "complicação": extrair_complicacao(texto),
-        "complicação_qual": extrair_complicacao_qual(texto),
-        "tto": extrair_tto(texto),
-        "Clavien": extrair_Clavien(texto),
-        "Clavien_v2": extrair_Clavien_v2(texto),
-        "reinternação": extrair_reinternacao(texto),
-        "data da reinternação": extrair_data_reinternacao(texto),
-        "motivo_reinternação": extrair_motivo_reinternacao(texto),
-        "re_op_90dias": extrair_re_op_90dias(texto),
-        "re_op_achado": extrair_re_op_achado(texto),
-        "obito_90dias": extrair_obito_90dias(texto),
-    })
-    
-    # Campos de patologia
-    resultado.update({
-        "histologia": extrair_histologia(texto),
-        "AP": extrair_AP(texto),
-        "estadiamento": extrair_estadiamento(texto),
-        "T": extrair_T(texto),
-        "N": extrair_N(texto),
-        "N_A": extrair_N_A(texto),
-        "invasão": extrair_invasao(texto),
-        "R0_R1_R2": extrair_R0_R1_R2(texto),
-        "R0_R1_R2_v2": extrair_R0_R1_R2_v2(texto),
-        "QT_adjuvante": extrair_QT_adjuvante(texto),
-        "recidiva": extrair_recidiva(texto),
-        "recidiva_local": extrair_recidiva_local(texto),
-        "recidiva_local_v2": extrair_recidiva_local_v2(texto),
-        "dt_recidiva": extrair_dt_recidiva(texto),
-        "DFSMESES": extrair_DFSMESES(texto),
-        "fisiatria": extrair_fisiatria(texto),
-        "paliativo_grupo_dor": extrair_paliativo_grupo_dor(texto),
-        "grupo_dor": extrair_grupo_dor(texto),
-        "ult_consulta": extrair_ult_consulta(texto),
-        "OS_meses": extrair_OS_meses(texto),
-        "obito": extrair_obito(texto),
-        "dt_obito": extrair_dt_obito(texto),
-        "obito_motivo": extrair_obito_motivo(texto),
-        "assistente": extrair_assistente(texto),
-        "observação": extrair_observacao(texto),
-    })
-    
+    resultado["amputação"] = extrair_amputacao(texto)
+    resultado["RTS"] = extrair_RTS(texto)
+    resultado["cole_total"] = extrair_cole_total(texto)
+    resultado["posterior"] = extrair_posterior(texto)
+    resultado["total"] = extrair_total(texto)
+    resultado["SLE"] = extrair_SLE(texto)
+    resultado["REC_plastica"] = extrair_REC_plastica(texto)
+    resultado["tipo_REC"] = extrair_tipo_REC(texto)
+
+    resultado[
+        "tipo de rec uro  0 briker 1 duplo barril 2 duplo barril ileal 3 nefrostomia"
+    ] = extrair_tipo_rec_uro(texto)
+
+    # CH / complicações / tto / Clavien / reinternação / re-op
+    resultado["CH_intra_OP"] = extrair_CH_intra_OP(texto, contexto_cirurgia)
+    resultado["CH_num"] = extrair_CH_num(texto, contexto_cirurgia)
+
+    resultado["complicação"] = extrair_complicacao(texto)
+    resultado["complicação_qual"] = extrair_complicacao_qual(texto)
+    resultado["tto"] = extrair_tto(texto)
+
+    resultado["Clavien"] = extrair_Clavien(texto)
+    resultado["Clavien_v2"] = extrair_Clavien_v2(texto)
+
+    resultado["reinternação"] = extrair_reinternacao(texto)
+    resultado["data da reinternação"] = extrair_data_reinternacao(texto)
+    resultado["motivo_reinternação"] = extrair_motivo_reinternacao(texto)
+
+    # re-op em 90 dias: regra com default 0
+    resultado["re_op_90dias"] = extrair_re_op_90dias(texto, data_cirurgia)
+    resultado["re_op_achado"] = extrair_re_op_achado(texto)
+
+    resultado["obito_90dias"] = extrair_obito_90dias(texto)
+
+    # ------------------------------------------------------------------
+    # BLOCO: Seguimento / recidiva / óbito
+    # ------------------------------------------------------------------
+
+    resultado["histologia"] = extrair_histologia(texto)
+    # AP já preenchido acima; só mantém se não tiver nada
+    if not resultado.get("AP"):
+        resultado["AP"] = extrair_AP(texto)
+
+    resultado["invasão"] = extrair_invasao(texto)
+    resultado["R0_R1_R2"] = extrair_R0_R1_R2(texto)
+    resultado["R0_R1_R2_v2"] = extrair_R0_R1_R2_v2(texto)
+    resultado["QT_adjuvante"] = extrair_QT_adjuvante(texto)
+
+    resultado["recidiva"] = extrair_recidiva(texto)
+    resultado["recidiva_local"] = extrair_recidiva_local(texto)
+    resultado["recidiva_local_v2"] = extrair_recidiva_local_v2(texto)
+    resultado["dt_recidiva"] = extrair_dt_recidiva(texto)
+    resultado["DFSMESES"] = extrair_DFSMESES(texto)
+
+    resultado["fisiatria"] = extrair_fisiatria(texto)
+    resultado["paliativo_grupo_dor"] = extrair_paliativo_grupo_dor(texto)
+    resultado["grupo_dor"] = extrair_grupo_dor(texto)
+
+    resultado["ult_consulta"] = extrair_ult_consulta(texto)
+    resultado["OS_meses"] = extrair_OS_meses(texto)
+
+    resultado["obito"] = extrair_obito(texto)
+    resultado["dt_obito"] = extrair_dt_obito(texto)
+    resultado["obito_motivo"] = extrair_obito_motivo(texto)
+
+    resultado["assistente"] = extrair_assistente(texto)
+    resultado["observação"] = extrair_observacao(texto)
+
+    # ------------------------------------------------------------------
+    # BLOCO: tempo de seguimento / tempo_SO
+    # ------------------------------------------------------------------
+    resultado["tempo_SO"] = extrair_tempo_SO(
+        data_cirurgia,
+        dt_alta=resultado.get("dt_alta"),
+        dt_ult_consulta=resultado.get("ult_consulta"),
+        dt_obito=resultado.get("dt_obito"),
+    )
+
     return resultado
 
+import unicodedata
+from datetime import datetime
 
-def normalizar_valor_comparacao(valor: Any) -> str:
-    """Normaliza valores para comparação (datas, números, etc)"""
+def normalizar_valor_comparacao(valor):
     if valor is None:
         return ""
-    
+
+    # Trata números primeiro
     if isinstance(valor, (int, float)):
-        if pd.isna(valor):
-            return ""
-        return str(int(valor)) if isinstance(valor, float) and valor.is_integer() else str(valor)
-    
-    valor_str = str(valor).strip().lower()
-    
-    # Tenta normalizar datas
-    if "/" in valor_str or "-" in valor_str:
         try:
-            for fmt in ["%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"]:
-                try:
-                    dt = datetime.strptime(valor_str.split()[0], fmt)
-                    return dt.strftime("%d/%m/%Y")
-                except:
-                    continue
-        except:
+            if pd.isna(valor):
+                return ""
+        except (TypeError, ValueError):
             pass
-    
-    return valor_str
+
+        if isinstance(valor, float) and valor.is_integer():
+            return str(int(valor))
+        return str(valor)
+
+    s = str(valor).strip().lower()
+
+    # Remove acentos
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+
+    # Normaliza datas básicas
+    if "/" in s or "-" in s:
+        pedacos = s.split()
+        parte_data = pedacos[0]
+        formatos = ["%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"]
+        for fmt in formatos:
+            try:
+                dt = datetime.strptime(parte_data, fmt)
+                return dt.strftime("%d/%m/%Y")
+            except Exception:
+                pass
+    return s
+
 
 
 def comparar_com_gabarito(paciente_slug: str, pred: dict, df_gabarito: pd.DataFrame, campos: list[str]) -> Dict[str, Any]:
@@ -1718,35 +2452,40 @@ def comparar_com_gabarito(paciente_slug: str, pred: dict, df_gabarito: pd.DataFr
     for campo in campos:
         if campo not in linha_real.index:
             continue
-        
+
         valor_real = linha_real[campo]
         valor_pred = pred.get(campo, None)
-        
+
+        # Se o Excel tiver colunas duplicadas com o mesmo nome,
+        # linha_real[campo] vira uma Series. Pegamos o primeiro valor.
         if isinstance(valor_real, pd.Series):
             if valor_real.empty:
                 continue
-            valor_real = valor_real.iloc[0] if len(valor_real) > 0 else None
-        
+            valor_real = valor_real.iloc[0]
+
         try:
             if pd.isna(valor_real):
                 continue
         except (TypeError, ValueError):
             pass
-        
+
         s_real = normalizar_valor_comparacao(valor_real)
         if s_real in ["nan", "none", "", "nat", "na"]:
             continue
-        
+
         total += 1
         s_pred = normalizar_valor_comparacao(valor_pred)
-        
-        ok = (s_real == s_pred)
+        ok = s_real == s_pred
+
         if ok:
             acertos += 1
-        
-        status = 'OK' if ok else 'ERRO'
+
+        status = "OK" if ok else "ERRO"
         print(f" - {campo}: real = {s_real!r}, pred = {s_pred!r}  ->  {status}")
-        detalhes.append({"campo": campo, "real": s_real, "pred": s_pred, "ok": ok})
+
+        detalhes.append(
+            {"campo": campo, "real": s_real, "pred": s_pred, "ok": ok}
+        )
     
     acc = acertos / total if total > 0 else 0.0
     print(f"\nAcurácia em {total} campos válidos: {acc:.1%} ({acertos}/{total})")
